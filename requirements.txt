@@ -1,0 +1,7 @@
+streamlit
+langchain
+langchain-groq
+requests
+beautifulsoup4
+PyPDF2
+python-docx
