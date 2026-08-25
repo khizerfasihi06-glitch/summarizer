@@ -67,7 +67,7 @@ def load_input_text(source_type: str, **kwargs) -> str:
 
 
 # Removed Mistral to exclusively leverage Llama architecture on Groq
-MODEL = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
+MODEL = ['openai/gpt-oss-120b', 'openai/gpt-oss-20b']
 
 length_guidance = {
     "short": "keep the summary very tight 3-5 sentence max.",
