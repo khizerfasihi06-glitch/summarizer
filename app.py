@@ -1,4 +1,5 @@
 import os
+import time
 from datetime import datetime
 
 import streamlit as st
@@ -129,17 +130,17 @@ def get_llm(api_key: str, model: str) -> ChatGroq:
 
 
 def summarize(llm: ChatGroq, text: str, length: str) -> str:
-    CHUNK_LIMIT_CHARS = 15000
+    CHUNK_LIMIT_CHARS = 5000
     chain = SUMMARY_PROMPT | llm | StrOutputParser()
 
-    if len(text) <= 25000:
+    if len(text) <= 8000:
         return chain.invoke({"text": text, "length_guidance": length_guidance[length]})
 
     st.info("⚠️ This is a large document. Processing via a multi-stage summary pipeline...")
 
     text_splitter = RecursiveCharacterTextSplitter(
         chunk_size=CHUNK_LIMIT_CHARS,
-        chunk_overlap=1500
+        chunk_overlap=300
     )
     chunks = text_splitter.split_text(text)
 
@@ -155,6 +156,8 @@ def summarize(llm: ChatGroq, text: str, length: str) -> str:
         })
         chunk_summaries.append(partial_res)
         progress_bar.progress((i + 1) / len(chunks))
+        if i < len(chunks) - 1:
+            time.sleep(8)  # pace requests to stay under free-tier TPM limits
 
     progress_bar.empty()
     status.write("Synthesizing final structural summary...")
@@ -170,10 +173,10 @@ def summarize(llm: ChatGroq, text: str, length: str) -> str:
 
 
 def generate_exam_qa(llm: ChatGroq, text: str, num_mcq: int, num_short: int, num_long: int) -> str:
-    CHUNK_LIMIT_CHARS = 15000
+    CHUNK_LIMIT_CHARS = 4000
     chain = QA_PROMPT | llm | StrOutputParser()
 
-    if len(text) <= 25000:
+    if len(text) <= 6000:
         return chain.invoke({
             "text": text,
             "num_mcq": num_mcq,
@@ -185,7 +188,7 @@ def generate_exam_qa(llm: ChatGroq, text: str, num_mcq: int, num_short: int, num
 
     text_splitter = RecursiveCharacterTextSplitter(
         chunk_size=CHUNK_LIMIT_CHARS,
-        chunk_overlap=1500
+        chunk_overlap=300
     )
     chunks = text_splitter.split_text(text)
 
@@ -208,6 +211,8 @@ def generate_exam_qa(llm: ChatGroq, text: str, num_mcq: int, num_short: int, num
         })
         chunk_outputs.append(partial_res)
         progress_bar.progress((i + 1) / len(chunks))
+        if i < len(chunks) - 1:
+            time.sleep(8)  # pace requests to stay under free-tier TPM limits
 
     progress_bar.empty()
     status.write("Selecting the best questions overall...")
@@ -248,9 +253,10 @@ with st.sidebar:
         length = st.select_slider("Summary length", options=["short", "medium", "detailed"], value="medium")
     else:
         st.caption("Exam Q&A question counts (Sir Syed University style)")
-        num_mcq = st.number_input("Multiple Choice Questions", min_value=0, max_value=30, value=10, step=1)
-        num_short = st.number_input("Short Questions", min_value=0, max_value=20, value=5, step=1)
-        num_long = st.number_input("Long Questions", min_value=0, max_value=10, value=3, step=1)
+        num_mcq = st.number_input("Multiple Choice Questions", min_value=0, max_value=15, value=5, step=1)
+        num_short = st.number_input("Short Questions", min_value=0, max_value=10, value=3, step=1)
+        num_long = st.number_input("Long Questions", min_value=0, max_value=5, value=2, step=1)
+        st.caption("Kept modest to stay within Groq's free-tier rate limits (8,000 tokens/min).")
 
     st.markdown("Get a free Groq API key at [console.groq.com/keys](https://console.groq.com/keys)")
 
