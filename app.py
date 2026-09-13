@@ -129,12 +129,53 @@ def get_llm(api_key: str, model: str) -> ChatGroq:
     return ChatGroq(groq_api_key=api_key, model_name=model, temperature=0.3)
 
 
+def invoke_with_retry(chain, params: dict, status_placeholder=None, max_retries: int = 3):
+    """
+    Invoke a Groq chain, automatically retrying on transient 'tokens per minute'
+    rate limits (with the wait time Groq itself reports), but raising immediately
+    on daily quota exhaustion since waiting won't help within the same session.
+    """
+    for attempt in range(max_retries + 1):
+        try:
+            return chain.invoke(params)
+        except Exception as e:
+            msg = str(e)
+            is_rate_limit = "rate_limit_exceeded" in msg or "429" in msg
+            is_daily_limit = "tokens per day" in msg or "TPD" in msg
+
+            if not is_rate_limit or attempt == max_retries:
+                raise
+
+            if is_daily_limit:
+                # Daily quota exhausted — retrying won't help until it resets.
+                raise
+
+            wait_seconds = _parse_retry_seconds(msg) or 15
+            if status_placeholder is not None:
+                status_placeholder.write(
+                    f"⏳ Hit Groq's per-minute rate limit — waiting {wait_seconds:.0f}s and retrying "
+                    f"(attempt {attempt + 1}/{max_retries})..."
+                )
+            time.sleep(wait_seconds)
+
+
+def _parse_retry_seconds(error_message: str):
+    """Extract a 'Please try again in Xm Ys' / 'Xs' hint from a Groq error message."""
+    import re
+    match = re.search(r"try again in (?:(\d+)m)?([\d.]+)s", error_message)
+    if not match:
+        return None
+    minutes = float(match.group(1)) if match.group(1) else 0.0
+    seconds = float(match.group(2))
+    return minutes * 60 + seconds + 2  # small buffer
+
+
 def summarize(llm: ChatGroq, text: str, length: str) -> str:
     CHUNK_LIMIT_CHARS = 5000
     chain = SUMMARY_PROMPT | llm | StrOutputParser()
 
     if len(text) <= 8000:
-        return chain.invoke({"text": text, "length_guidance": length_guidance[length]})
+        return invoke_with_retry(chain, {"text": text, "length_guidance": length_guidance[length]})
 
     st.info("⚠️ This is a large document. Processing via a multi-stage summary pipeline...")
 
@@ -150,10 +191,10 @@ def summarize(llm: ChatGroq, text: str, length: str) -> str:
 
     for i, chunk in enumerate(chunks):
         status.write(f"Processing chunk {i + 1} of {len(chunks)}...")
-        partial_res = chain.invoke({
+        partial_res = invoke_with_retry(chain, {
             "text": chunk,
             "length_guidance": "Keep this component snippet dense and concise."
-        })
+        }, status_placeholder=status)
         chunk_summaries.append(partial_res)
         progress_bar.progress((i + 1) / len(chunks))
         if i < len(chunks) - 1:
@@ -164,10 +205,10 @@ def summarize(llm: ChatGroq, text: str, length: str) -> str:
 
     combined_intermediates = "\n\n--- Chunk Summary Breakdown ---\n\n".join(chunk_summaries)
 
-    final = chain.invoke({
+    final = invoke_with_retry(chain, {
         "text": combined_intermediates,
         "length_guidance": length_guidance[length]
-    })
+    }, status_placeholder=status)
     status.empty()
     return final
 
@@ -177,7 +218,7 @@ def generate_exam_qa(llm: ChatGroq, text: str, num_mcq: int, num_short: int, num
     chain = QA_PROMPT | llm | StrOutputParser()
 
     if len(text) <= 6000:
-        return chain.invoke({
+        return invoke_with_retry(chain, {
             "text": text,
             "num_mcq": num_mcq,
             "num_short": num_short,
@@ -203,12 +244,12 @@ def generate_exam_qa(llm: ChatGroq, text: str, num_mcq: int, num_short: int, num
 
     for i, chunk in enumerate(chunks):
         status.write(f"Generating questions from chunk {i + 1} of {len(chunks)}...")
-        partial_res = chain.invoke({
+        partial_res = invoke_with_retry(chain, {
             "text": chunk,
             "num_mcq": per_chunk_mcq,
             "num_short": per_chunk_short,
             "num_long": per_chunk_long,
-        })
+        }, status_placeholder=status)
         chunk_outputs.append(partial_res)
         progress_bar.progress((i + 1) / len(chunks))
         if i < len(chunks) - 1:
@@ -219,12 +260,12 @@ def generate_exam_qa(llm: ChatGroq, text: str, num_mcq: int, num_short: int, num
 
     combined_intermediates = "\n\n--- Chunk Question Set ---\n\n".join(chunk_outputs)
 
-    final = chain.invoke({
+    final = invoke_with_retry(chain, {
         "text": combined_intermediates,
         "num_mcq": num_mcq,
         "num_short": num_short,
         "num_long": num_long,
-    })
+    }, status_placeholder=status)
     status.empty()
     return final
 
@@ -245,7 +286,10 @@ with st.sidebar:
         value=os.environ.get("GROQ_API_KEY", ""),
         help="Get a free key at https://console.groq.com/keys",
     )
-    model = st.selectbox("Model", MODEL, index=0)
+    model = st.selectbox(
+        "Model", MODEL, index=1,
+        help="`20b` uses fewer tokens per request, stretching Groq's free daily quota further.",
+    )
 
     mode = st.radio("Output mode", ["📝 Summary", "🎓 Exam Q&A"], index=0)
 
@@ -317,7 +361,21 @@ if pending_source:
                     else:
                         result = generate_exam_qa(llm, input_text, num_mcq, num_short, num_long)
                 except Exception as e:
-                    st.error(f"Error generating output: {e}")
+                    msg = str(e)
+                    if "tokens per day" in msg or "TPD" in msg:
+                        st.error(
+                            "🚫 You've hit Groq's **daily** free-tier token limit (200,000 tokens/day). "
+                            "This resets over time, but retrying immediately won't help. Try again later, "
+                            "switch to the smaller `openai/gpt-oss-20b` model to use fewer tokens per request, "
+                            "or upgrade at https://console.groq.com/settings/billing."
+                        )
+                    elif "rate_limit_exceeded" in msg or "429" in msg:
+                        st.error(
+                            "⏳ Groq's per-minute rate limit was hit repeatedly and retries were exhausted. "
+                            "Try again in a minute, or reduce the input size / question counts."
+                        )
+                    else:
+                        st.error(f"Error generating output: {e}")
                     result = None
 
             if result:
